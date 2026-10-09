@@ -64,3 +64,8 @@ cue2_cor_matrix = correlate_states_F(results[0], cue2_results[0])
 plot_correlations_F(cue1_cor_matrix, train_labels, cue1_labels, save=True)
 plot_correlations_F(cue2_cor_matrix, train_labels, cue2_labels, save=True)
 
+
+# PCA
+
+plot_PCA(results[0], train_labels, steps=100, start=None, save=True)
+

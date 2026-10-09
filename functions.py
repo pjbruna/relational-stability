@@ -57,3 +57,45 @@ def plot_correlations_F(r_mat, train_labels, cue_labels, save=True):
   else:
     plt.show()
 
+
+## PCA ##
+
+def plot_PCA(train_data, train_labels, steps=100, start=None, save=True):
+    if start is None:   # use last {steps} timesteps if {start} not specified
+      start = train_data.shape[1] - steps
+    end = start + steps
+    
+    plot_data = np.array(train_data.iloc[:, start:end]).T
+    labels = np.array(train_labels[start:end]).ravel()
+
+    pca = PCA(n_components=3)
+    pca_data = pca.fit_transform(plot_data)
+    variance = pca.explained_variance_ratio_
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    for label in np.unique(labels):
+        mask = labels == label
+        ax.scatter(
+            pca_data[mask, 0],
+            pca_data[mask, 1],
+            pca_data[mask, 2],
+            label=label,
+            alpha=0.8
+        )
+
+    ax.set_xlabel(f'PC1 ({variance[0]*100:.1f}%)')
+    ax.set_ylabel(f'PC2 ({variance[1]*100:.1f}%)')
+    ax.set_zlabel(f'PC3 ({variance[2]*100:.1f}%)')
+    ax.legend()
+
+    plt.tight_layout()
+
+    if save==True:
+      timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+      plt.savefig(f'figures/PCA_{start}-{end}steps_{timestamp}.png')
+    else:
+      plt.show()
+
+    # return pca_data, pca.explained_variance_ratio_
