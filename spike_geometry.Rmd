@@ -1,0 +1,142 @@
+---
+title: "RSA (spikes)"
+output: html_document
+date: "2026-10-10"
+---
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+spikes <- read.csv("data/log_spikes.csv")
+labels <- read.csv("data/log_labels.csv")
+
+data <- cbind(spikes, labels) %>%
+  mutate(time = row_number())
+```
+
+
+# do neural states drift?
+
+```{r}
+key_list <- unique(labels$label)
+correlations <- data.frame()
+
+for(key in key_list){
+  temp <- data %>%
+    filter(label==key)
+  
+  last <- as.numeric(temp[nrow(temp), 1:100])
+  prev <- temp[-nrow(temp), 1:100]
+  
+  corr <- apply(prev, 1, function(row){cor(as.numeric(row), last, method="pearson")})
+  
+  temp$r <- c(corr, NA)
+  
+  correlations <- rbind(correlations, temp %>% select(r,time,label))
+}
+```
+
+```{r}
+correlations %>%
+  mutate(label = factor(label, levels = c("man_s", "dog_s", "walks_v", "bites_v", "man_o", "dog_o", "_"))) %>%
+  ggplot(aes(x=time, y=r, color=label)) +
+    facet_wrap(~label, ncol=2) +
+    geom_point() +
+    geom_line() +
+    scale_x_reverse() +
+    theme_minimal()
+
+# ggsave("figures/cross_cor.png", bg = "white")
+```
+
+
+# does representational geometry persist?
+
+```{r}
+key_list <- unique(data$label)
+node_colnames <- names(data)[1:100]
+
+n_windows <- 20
+
+data_windowed <- data %>%
+  mutate(window = cut(time,
+                      breaks = seq(min(time, na.rm = TRUE), max(time, na.rm = TRUE), length.out = n_windows + 1),
+                      include.lowest = TRUE,
+                      labels = FALSE))
+
+
+# # randomly sample N observations per label per window
+# 
+# set.seed(42)
+# 
+# obs <- data_windowed %>%
+#   count(window, label, name = "n_obs")
+# 
+# min_n <- min(obs$n_obs)
+# 
+# data_balanced <- data_windowed %>%
+#   group_by(window, label) %>%
+#   slice_sample(n=min_n)
+# 
+# avg_window <- data_balanced %>%
+#   group_by(window, label) %>%
+#   summarise(n_obs = n(), across(all_of(node_colnames), ~ mean(.x)))
+
+
+avg_window <- data_windowed %>%
+  group_by(window, label) %>%
+  summarise(n_obs = n(), across(all_of(node_colnames), ~ mean(.x)))
+
+            
+# # check that windows contain every label
+# 
+# avg_window %>%
+#   group_by(window) %>%
+#   summarise(n_labels = n_distinct(label)) %>%
+#   mutate(valid = n_labels == length(key_list))
+
+
+# calculate RDM per window
+
+rdm_list <- list()
+
+for(w in c(1:n_windows)){
+  temp <- avg_window %>%
+    filter(window == w) %>%
+    slice(match(key_list, label))
+
+  X <- as.matrix(temp[, node_colnames])
+  rownames(X) <- temp$label
+
+  RDM <- as.matrix(dist(X, method = "euclidean"))
+  # RDM <- 1 - cor(t(X), method = "pearson")
+
+  rdm_list[[as.character(w)]] <- RDM
+}
+
+
+# compare across windows
+
+rdm_vectors <- lapply(rdm_list, function(RDM) {RDM[upper.tri(RDM)]})
+
+rsa_matrix <- cor(do.call(cbind, rdm_vectors), method = "pearson")
+dimnames(rsa_matrix) <- list(names(rdm_list), names(rdm_list))
+
+rsa_df <- as.data.frame(as.table(rsa_matrix))
+names(rsa_df) <- c("window_1", "window_2", "rsa_similarity")
+```
+
+```{r}
+ggplot(rsa_df, aes(x = window_1, y = window_2, fill = rsa_similarity)) +
+  geom_tile() +
+  scale_fill_viridis_c(limits = c(-1, 1)) +
+  labs(x = "time window",
+       y = "time window",
+       fill = "r") +
+  theme_minimal()
+
+ggsave("figures/geometry.png", bg="white")
+```
+

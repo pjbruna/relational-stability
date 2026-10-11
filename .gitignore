@@ -1,12 +1,12 @@
 # RStudio project files
-# .Rproj.user/
-# *.Rproj
-# .Rhistory
-# .RData
-# .Ruserdata
+.Rproj.user/
+*.Rproj
+.Rhistory
+.RData
+.Ruserdata
 
 # R package build artifacts
-# *.tar.gz
+*.tar.gz
 
 # Generated documentation
 man/
@@ -18,8 +18,8 @@ docs/
 *.swp
 
 # Data files
-# data/
-# *.csv
+data/
+*.csv
 
 # OS-specific files
 .DS_Store

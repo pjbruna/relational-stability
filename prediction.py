@@ -46,6 +46,11 @@ for _ in range(1000):
 model = FalandaysNetwork(input_nnodes=len(train_data[0]), nnodes=100, p_link=0.1, leak=0.75, lrate_wmat=0.1, lrate_targ=0.01, targ_min=1) 
 results = model.run(train_data)
 
+## Store spikes ##
+
+# results[0].T.to_csv("data/log_spikes.csv", index=False)
+# pd.DataFrame(train_labels, columns=["label"]).to_csv("data/log_labels.csv", index=False)
+
 
 ## Cue trained model ##
 
@@ -65,7 +70,7 @@ plot_correlations_F(cue1_cor_matrix, train_labels, cue1_labels, save=True)
 plot_correlations_F(cue2_cor_matrix, train_labels, cue2_labels, save=True)
 
 
-# PCA
+## PCA ##
 
 plot_PCA(results[0], train_labels, steps=100, start=None, save=True)
 
