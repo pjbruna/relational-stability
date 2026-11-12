@@ -1,10 +1,52 @@
 import numpy as np
+import random
 import scipy.stats
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from matplotlib import cm
 from datetime import datetime
+
+## Generate input sequence for Falandays et al. 2021-style language task ##
+
+def input_sequence(steps=None, start='_c'):
+  input_keys=['man_s','dog_s','walks_v','bites_v','dog_o','man_o','_a', '_b', '_c']
+  input_dict = {
+      'man_s':    [1,0,0,0,0,0,0],
+      'dog_s':    [0,1,0,0,0,0,0],
+      'walks_v':  [0,0,1,0,0,0,0],
+      'bites_v':  [0,0,0,1,0,0,0],
+      'dog_o':    [0,1,0,0,0,0,0],
+      'man_o':    [1,0,0,0,0,0,0],
+      '_a':       [0,0,0,0,1,0,0],
+      '_b':       [0,0,0,0,0,1,0],
+      '_c':       [0,0,0,0,0,0,1]
+  }
+
+  grammarmat=np.zeros((9,9))
+  grammarmat[0,2] = .75; grammarmat[0,3]=.25;
+  grammarmat[1,2] = .25; grammarmat[1,3]=.75;
+  grammarmat[2,4] = .75; grammarmat[2,5]=.25;
+  grammarmat[3,4] = .25; grammarmat[3,5]=.75;
+  grammarmat[4,6] = 1; 
+  grammarmat[5,6] = 1; 
+  grammarmat[6,7] = 1; 
+  grammarmat[7,8] = 1; 
+  grammarmat[8,0] = .5; grammarmat[8,1]=.5;
+
+  data = []
+  labels = []
+  input_key = start
+
+  for _ in range(steps):
+    index1 = input_keys.index(input_key)
+    input_key = random.choices(input_keys, weights=grammarmat[index1])[0]
+    index2 = input_keys.index(input_key) 
+
+    data.append(input_dict[input_key])
+    labels.append(input_key)
+
+  return data, labels
 
 
 ## Falandays et al. 2021 analyses ##

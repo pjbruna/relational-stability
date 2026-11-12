@@ -1,0 +1,794 @@
+---
+title: "Drift and stability"
+output: html_document
+date: "2026-11-08"
+---
+
+```{r, warning=FALSE}
+library(tidyverse)
+library(broom)
+library(patchwork)
+library(plotly)
+```
+
+
+# Process data
+```{r}
+data_full <- data.frame()
+
+for(r in c(0:9)){
+  spikes <- read.csv(paste0("data/wmat1/log_spikes_48000_sim", r, ".csv"))
+  labels <- read.csv(paste0("data/wmat1/log_labels_48000_sim", r, ".csv"))
+  
+  data <- cbind(spikes, labels) %>%
+    mutate(time = row_number(),
+           sim = r)
+  
+  data_full <- rbind(data_full, data)
+}
+```
+
+```{r}
+data_full$label <- case_when(
+  data_full$label=="man_s" ~ "man",
+  data_full$label=="dog_s" ~ "dog",
+  TRUE ~ data_full$label
+)
+
+data_full$label <- case_when(
+  data_full$label=="walks_v" & lag(data_full$label)=="man" ~ "man_walks",
+  data_full$label=="walks_v" & lag(data_full$label)=="dog" ~ "dog_walks",
+  data_full$label=="bites_v" & lag(data_full$label)=="man" ~ "man_bites",
+  data_full$label=="bites_v" & lag(data_full$label)=="dog" ~ "dog_bites",
+  TRUE ~ data_full$label
+)
+
+data_full$label <- case_when(
+  data_full$label=="man_o" & lag(data_full$label)=="man_walks" ~ "man_walks_man",
+  data_full$label=="man_o" & lag(data_full$label)=="dog_walks" ~ "dog_walks_man",
+  data_full$label=="man_o" & lag(data_full$label)=="man_bites" ~ "man_bites_man",
+  data_full$label=="man_o" & lag(data_full$label)=="dog_bites" ~ "dog_bites_man",
+  data_full$label=="dog_o" & lag(data_full$label)=="man_walks" ~ "man_walks_dog",
+  data_full$label=="dog_o" & lag(data_full$label)=="dog_walks" ~ "dog_walks_dog",
+  data_full$label=="dog_o" & lag(data_full$label)=="man_bites" ~ "man_bites_dog",
+  data_full$label=="dog_o" & lag(data_full$label)=="dog_bites" ~ "dog_bites_dog",
+  TRUE ~ data_full$label
+)
+
+data_full_filtered <- data_full %>%
+  filter(time > 3000) # remove burn-in
+
+token_list <- unique(data_full_filtered$label)
+subject_list <- c("man", "dog")
+verb_list <- c("man_walks", "dog_walks", "man_bites", "dog_bites")
+object_list <- c("man_walks_man", "dog_walks_man", "man_bites_man", "dog_bites_man", "man_walks_dog", "dog_walks_dog", "man_bites_dog", "dog_bites_dog")
+buffer_list <- c("_a", "_b", "_c")
+node_id <- colnames(data_full[,1:100])
+sim_id <- c(0:9)
+```
+
+
+# Avg embeddings
+```{r}
+n_windows=25
+
+avg_embeddings <- data_full_filtered %>%
+  filter(label %in% token_list) %>%
+  mutate(window = cut(time, breaks = seq(min(time, na.rm = TRUE), max(time, na.rm = TRUE),
+                                         length.out = n_windows + 1), include.lowest = TRUE, labels = FALSE)) %>%
+  group_by(window, label, sim) %>%
+  summarise(n_obs = n(), across(all_of(node_id), ~ mean(.x)), .groups = "drop") %>%
+  pivot_longer(cols = all_of(node_id), names_to = "node", values_to = "value") %>%
+  mutate(label = factor(label, levels = c(subject_list, verb_list, object_list, buffer_list)),
+         class = factor(case_when(label %in% subject_list ~ "subject",
+                                  label %in% verb_list ~ "verb",
+                                  label %in% object_list ~ "object",
+                                  T ~ "buffer"),
+                        levels = c("subject", "verb", "object", "buffer")))
+
+avg_embeddings %>%
+  ggplot(aes(x=n_obs)) +
+    facet_wrap(~label) +
+    geom_histogram()
+```
+
+
+# Token-level drift
+```{r}
+token_combs <- expand.grid(f1=token_list, f2=sim_id)
+
+token_similarity <- do.call(rbind, lapply(seq_len(nrow(token_combs)), function(row){
+  subset <- avg_embeddings %>%
+    filter(label==token_combs[row,1], sim==token_combs[row,2]) %>%
+    pivot_wider(names_from = node, values_from = value)
+  
+  windows <- subset$window
+  x <- as.matrix(subset %>% ungroup() %>% select(!c(window,label,sim,n_obs,class)))
+  n <- nrow(x)
+ 
+  pairs <- combn(n,2)
+  r <- apply(pairs, 2, function(p) {cor(x[p[1], ], x[p[2], ], method = "pearson")})
+
+  data.frame(class=unique(subset$class),
+             label=token_combs[row,1],
+             sim=token_combs[row,2],
+             window1=pairs[1,],
+             window2=pairs[2,],
+             cor=r)
+}))
+```
+
+```{r}
+token_similarity %>%
+  group_by(label, window1, window2) %>%
+  summarise(m = mean(cor), .groups ="drop") %>%
+  mutate(label = factor(label, levels = c(subject_list, verb_list, object_list, buffer_list))) %>%
+  ggplot(aes(x=window1, y=window2, fill=m)) +
+    facet_wrap(~label) +
+    geom_tile() +
+    scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "time window", y = "time window", fill = "r") +
+    theme_minimal() +
+    theme(panel.grid = element_blank(),
+          axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          strip.text = element_text(size=28),
+          legend.title = element_text(size=28),
+          legend.text = element_text(size=26))
+
+token_similarity %>%
+  group_by(label, window1, window2) %>%
+  reframe(class = class, cor = mean(cor)) %>%
+  mutate(diag = window2 - window1) %>%
+  filter(diag > 0) %>%
+  group_by(diag, label) %>%
+  reframe(class=class, m = mean(cor), se = sd(cor)/sqrt(n())) %>%
+  mutate(label = factor(label, levels = c(subject_list, verb_list, object_list, buffer_list)),
+         class = factor(class, levels = c("subject", "verb", "object", "buffer"))) %>%
+  ggplot(aes(x=diag, y=m, group=label, color=label, fill=label)) +
+    facet_wrap(~class) +
+    geom_line() +
+    geom_ribbon(aes(ymin=m-se, ymax=m+se), alpha=0.2, linetype=0) +
+    labs(x = "lag", y = "r") +
+    theme_minimal() +
+    theme(axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          strip.text = element_text(size=28),
+          legend.title = element_blank(),
+          legend.text = element_text(size=26),
+          legend.key.spacing.y = unit(1, "cm")) +
+    guides(color = guide_legend(ncol = 2), fill = guide_legend(ncol = 2))
+```
+
+```{r}
+token_similarity %>%
+  group_by(label, window1, window2) %>%
+  summarise(cor = mean(cor), .groups ="drop") %>%
+  mutate(diag = window2 - window1) %>%
+  filter(diag > 0) %>%
+  group_by(diag, label) %>%
+  summarise(m = mean(cor), se = sd(cor)/sqrt(n()), .groups = "drop") %>%
+  mutate(label = factor(label, levels = c(subject_list, verb_list, object_list, buffer_list))) %>%
+  group_by(label) %>%
+  do(tidy(lm(m ~ diag, data = .))) %>%
+  filter(term == "diag") %>%
+  select(label, b = estimate, se = std.error) %>%
+  print()
+```
+
+
+## Cross-token drift
+```{r}
+cross_combs <- combn(token_list, 2, simplify = FALSE)
+
+crosstoken_similarity <- do.call(rbind, lapply(cross_combs, function(pair) {
+
+  do.call(rbind, lapply(sim_id, function(s) {
+
+    token1 <- avg_embeddings %>%
+      filter(label == pair[1], sim == s) %>%
+      pivot_wider(names_from = node, values_from = value) %>%
+      arrange(window)
+
+    token2 <- avg_embeddings %>%
+      filter(label == pair[2], sim == s) %>%
+      pivot_wider(names_from = node, values_from = value) %>%
+      arrange(window)
+
+    x <- as.matrix(token1 %>% ungroup %>% select(!c(window, label, sim, n_obs, class)))
+
+    y <- as.matrix(token2 %>% ungroup %>% select(!c(window, label, sim, n_obs, class)))
+
+    # vectorized correlation
+    x_centered <- x - rowMeans(x)
+    y_centered <- y - rowMeans(y)
+    
+    x_norm <- x_centered / sqrt(rowSums(x_centered^2))
+    y_norm <- y_centered / sqrt(rowSums(y_centered^2))
+    
+    pearson <- x_norm %*% t(y_norm)
+
+    # store
+    expand.grid(window1 = token1$window, window2 = token2$window) %>%
+      mutate(label1 = pair[1], label2 = pair[2], sim = s, cor = as.vector(pearson), pair = paste(pair, collapse = "x"))
+ }))
+}))
+```
+
+```{r}
+# for(p in unique(crosstoken_similarity$pair)){
+#   plot <- crosstoken_similarity %>%
+#     filter(pair == p) %>%
+#     group_by(window1, window2) %>%
+#     summarise(m = mean(cor), .groups = "drop") %>%
+#     ggplot(aes(x=window1, y=window2, fill=m)) +
+#       geom_tile() +
+#       scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"),
+#                                                   barwidth = unit(1,   "cm"))) +
+#       labs(title = p, x = "time window", y = "time window", fill = "r") +
+#       theme_minimal() +
+#       theme(panel.grid = element_blank(),
+#             axis.title = element_text(size=28),
+#             axis.text = element_text(size=26),
+#             strip.text = element_text(size=28),
+#             legend.title = element_text(size=28),
+#             legend.text = element_text(size=26))
+#   
+#   print(plot)
+# }
+
+
+crosstoken_similarity %>%
+  group_by(pair, window1, window2) %>%
+  summarise(cor = mean(cor), .groups ="drop") %>%
+  mutate(diag = window2 - window1) %>%
+  filter(diag > 0) %>%
+  group_by(diag, pair) %>%
+  summarise(m = mean(cor), se = sd(cor)/sqrt(n()), .groups = "drop") %>%
+  ggplot(aes(x=diag, y=m, group=pair)) +
+    geom_line(alpha=0.5) +
+    geom_ribbon(aes(ymin=m-se, ymax=m+se), alpha=0.2, linetype=0) +
+    labs(x = "lag", y = "r") +
+    theme_minimal() +
+    theme(axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          strip.text = element_text(size=28),
+          legend.title = element_blank(),
+          legend.text = element_text(size=26),
+          legend.key.spacing.y = unit(1, "cm"),
+          legend.position = "none")
+```
+
+```{r}
+crosstoken_similarity %>%
+  group_by(pair, window1, window2) %>%
+  summarise(cor = mean(cor), .groups ="drop") %>%
+  mutate(diag = window2 - window1) %>%
+  filter(diag > 0) %>%
+  group_by(diag, pair) %>%
+  summarise(m = mean(cor), se = sd(cor)/sqrt(n()), .groups = "drop") %>%
+  group_by(pair) %>%
+  do(tidy(lm(m ~ diag, data = .))) %>%
+  filter(term == "diag") %>%
+  select(pair, b = estimate, se = std.error) %>%
+  print()
+```
+
+
+# Relation-level stability
+```{r}
+geometry_over_time <- do.call(rbind, lapply(sim_id, function(s) {
+
+  do.call(rbind, lapply(unique(avg_embeddings$window), function(w) {
+
+    subset <- avg_embeddings %>%
+      filter(sim == s, window == w) %>%
+      pivot_wider(names_from = node, values_from = value) %>%
+      arrange(match(label, token_list))
+
+    x <- as.matrix(subset %>% ungroup() %>% select(!c(window, label, sim, n_obs, class)))
+
+    # vectorized cosine similarity
+    x_norm <- x / sqrt(rowSums(x^2))
+    cos <- x_norm %*% t(x_norm)
+
+    # store
+    expand.grid(label1 = subset$label, label2 = subset$label) %>%
+      mutate(sim = s, window = w, cos = as.vector(cos))
+  }))
+}))
+```
+
+```{r}
+geometry_over_time %>%
+  group_by(label1, label2, window) %>%
+  summarise(m = mean(cos), .groups = "drop") %>%
+  ggplot(aes(x=label1, y=label2, fill=m)) +
+    facet_wrap(~window) +
+    geom_tile() +
+    scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "token", y = "token", fill = expression(S[cos])) +
+    theme_minimal() +
+    theme(panel.grid = element_blank(),
+          axis.title = element_text(size=28),
+          axis.text = element_blank(),
+          strip.text = element_text(size=28),
+          legend.title = element_text(size=28),
+          legend.text = element_text(size=26))
+```
+
+```{r}
+geometry_similarity <- geometry_over_time %>%
+  mutate(label1 = as.character(label1), label2 = as.character(label2)) %>%
+  filter(label1 < label2) %>% # keep upper triangle
+  pivot_wider(names_from = window, values_from = cos) %>%
+  group_by(sim) %>%
+  summarise(cormat = list(cor(as.matrix(pick(-any_of(c("label1", "label2", "sim")))),
+                              method = "pearson", use = "pairwise.complete.obs")),
+            .groups = "drop") %>%
+  mutate(cormat = map(cormat, ~ as.data.frame(.x) %>%
+                        tibble::rownames_to_column("window1") %>%
+                        pivot_longer(cols = !window1, names_to = "window2", values_to = "cor"))) %>%
+  unnest(cormat) %>%
+  mutate(window1 = as.numeric(window1), window2 = as.numeric(window2))
+```
+
+```{r}
+geometry_similarity %>%
+  group_by(window1, window2) %>%
+  summarise(m = mean(cor), .groups = "drop") %>%
+  ggplot(aes(window1, window2, fill = m)) +
+    geom_tile() +
+    scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "time window", y = "time window", fill = "r") +
+    theme_minimal() +
+    theme(axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          strip.text = element_text(size=28),
+          legend.title = element_text(size=28),
+          legend.text = element_text(size=26))
+```
+
+## Simulations permuted
+```{r}
+geometry_data <- geometry_over_time %>%
+  mutate(label1 = as.character(label1), label2 = as.character(label2)) %>%
+  filter(label1 < label2) # keep upper triangle
+
+set.seed(123)
+n_perm <- 100
+windows <- sort(unique(geometry_data$window))
+sims <- sort(unique(geometry_data$sim))
+
+geometry_sims_permuted <- map_dfr(seq_len(n_perm), function(p) {
+
+  # shuffle simulation identities within each window
+  permuted_data <- map_dfr(windows, function(w) {
+    window_data <- geometry_data %>%
+      filter(window == w)
+
+    sim_permutation <- tibble(sim = sims, sim_perm = sample(sims))
+
+    window_data %>%
+      left_join(sim_permutation, by = "sim") %>%
+      mutate(sim = sim_perm) %>%
+      select(!sim_perm)
+  })
+
+  # calculate within-permuted-simulation correlations
+  permuted_data %>%
+    pivot_wider(names_from = window, values_from = cos) %>%
+    group_by(sim) %>%
+    summarise(cormat = list(cor(as.matrix(pick(-any_of(c("label1", "label2", "sim")))),
+                                method = "pearson", use = "pairwise.complete.obs")),
+              .groups = "drop") %>%
+    mutate(cormat = map(cormat, ~ as.data.frame(.x) %>%
+                          tibble::rownames_to_column("window1") %>%
+                          pivot_longer(cols = !window1, names_to = "window2", values_to = "cor"))) %>%
+    unnest(cormat) %>%
+    mutate(window1 = as.numeric(window1), window2 = as.numeric(window2), permutation = p)
+})
+```
+
+```{r}
+geometry_sims_permuted %>%
+  group_by(window1, window2) %>%
+  summarise(m = mean(cor), .groups = "drop") %>%
+  ggplot(aes(window1, window2, fill = m)) +
+    geom_tile() +
+    scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "time window", y = "time window", fill = "r") +
+    theme_minimal() +
+    theme(axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          strip.text = element_text(size=28),
+          legend.title = element_text(size=28),
+          legend.text = element_text(size=26))
+```
+
+
+## Tokens permuted
+```{r}
+geometry_data <- geometry_over_time %>%
+  mutate(label1 = as.character(label1), label2 = as.character(label2)) %>%
+  filter(label1 < label2) # keep upper triangle
+
+set.seed(123)
+n_perm <- 100
+windows <- sort(unique(geometry_data$window))
+sims <- sort(unique(geometry_data$sim))
+
+geometry_tokens_permuted <- map_dfr(seq_len(n_perm), function(p) {
+  
+  # shuffle token identities within each window
+  permuted_data <- map_dfr(sims, function(s) {
+    map_dfr(windows, function(w) {
+      window_data <- geometry_data %>%
+        filter(sim == s, window == w)
+
+      token_permutation <- tibble(label = token_list, label_perm = sample(token_list))
+
+      window_data %>%
+        left_join(token_permutation %>% rename(label1 = label, label1_perm = label_perm), by = "label1") %>%
+        left_join(token_permutation %>% rename(label2 = label, label2_perm = label_perm), by = "label2") %>%
+        mutate(label1 = label1_perm, label2 = label2_perm) %>% 
+        select(!c(label1_perm, label2_perm)) %>%
+        mutate(label_temp = pmin(label1, label2), label2 = pmax(label1, label2), label1 = label_temp) %>%
+        select(!label_temp)
+    })
+  })
+
+  # calculate within-simulation token-permuted correlations
+  permuted_data %>%
+    pivot_wider(names_from = window, values_from = cos) %>%
+    group_by(sim) %>%
+    summarise(cormat = list(cor(as.matrix(pick(-any_of(c("label1", "label2", "sim")))),
+                                method = "pearson", use = "pairwise.complete.obs")),
+              .groups = "drop") %>%
+    mutate(cormat = map(cormat, ~ as.data.frame(.x) %>%
+                          tibble::rownames_to_column("window1") %>%
+                          pivot_longer(cols = !window1, names_to = "window2", values_to = "cor"))) %>%
+    unnest(cormat) %>%
+    mutate(window1 = as.numeric(window1), window2 = as.numeric(window2), permutation = p)
+})
+```
+
+```{r}
+geometry_tokens_permuted %>%
+  group_by(window1, window2) %>%
+  summarise(m = mean(cor), .groups = "drop") %>%
+  ggplot(aes(window1, window2, fill = m)) +
+    geom_tile() +
+    scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "time window", y = "time window", fill = "r") +
+    theme_minimal() +
+    theme(axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          strip.text = element_text(size=28),
+          legend.title = element_text(size=28),
+          legend.text = element_text(size=26))
+```
+
+
+## Cross-run stability
+```{r}
+crossgeometry_over_time <- do.call(rbind, lapply(sim_id, function(s) {
+
+  s2 <- (s + 1) %% length(sim_id)
+
+  do.call(rbind, lapply(unique(avg_embeddings$window), function(w) {
+
+    subset1 <- avg_embeddings %>%
+      filter(sim == s, window == w) %>%
+      pivot_wider(names_from = node, values_from = value) %>%
+      arrange(match(label, token_list))
+
+    subset2 <- avg_embeddings %>%
+      filter(sim == s2, window == w) %>%
+      pivot_wider(names_from = node, values_from = value) %>%
+      arrange(match(label, token_list))
+
+    x <- as.matrix(subset1 %>% ungroup() %>% select(!c("window", "label", "sim", "n_obs", "class")))
+    y <- as.matrix(subset2 %>% ungroup() %>% select(!c("window", "label", "sim", "n_obs", "class")))
+
+    # vectorized cosine similarity
+    x_norm <- x / sqrt(rowSums(x^2))
+    y_norm <- y / sqrt(rowSums(y^2))
+
+    cos <- x_norm %*% t(y_norm)
+
+    # store
+    expand.grid(label1 = subset1$label, label2 = subset2$label) %>%
+      mutate(sim1 = s, sim2 = s2, window = w, cos = as.vector(cos))
+  }))
+}))
+```
+
+```{r}
+crossgeometry_over_time %>%
+  group_by(label1, label2, window) %>%
+  summarise(m = mean(cos), .groups = "drop") %>%
+  ggplot(aes(x=label1, y=label2, fill=m)) +
+    facet_wrap(~window) +
+    geom_tile() +
+    scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "token", y = "token", fill = expression(S[cos])) +
+    theme_minimal() +
+    theme(panel.grid = element_blank(),
+          axis.title = element_text(size=28),
+          axis.text = element_blank(),
+          strip.text = element_text(size=28),
+          legend.title = element_text(size=28),
+          legend.text = element_text(size=26))
+```
+
+```{r}
+crossgeometry_similarity <- crossgeometry_over_time %>%
+  pivot_wider(names_from = window, values_from = cos) %>%
+  select(!sim2) %>%
+  group_by(sim1) %>%
+  summarise(cormat = list(cor(as.matrix(pick(-any_of(c("label1", "label2", "sim")))),
+                              method = "pearson", use = "pairwise.complete.obs")),
+            .groups = "drop") %>%
+  mutate(cormat = map(cormat, ~ as.data.frame(.x) %>%
+                        tibble::rownames_to_column("window1") %>%
+                        pivot_longer(cols = !window1, names_to = "window2", values_to = "cor"))) %>%
+  unnest(cormat) %>%
+  mutate(window1 = as.numeric(window1), window2 = as.numeric(window2))
+```
+
+```{r}
+crossgeometry_similarity %>%
+  group_by(window1, window2) %>%
+  summarise(m = mean(cor), .groups = "drop") %>%
+  ggplot(aes(window1, window2, fill = m)) +
+    geom_tile() +
+    scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "time window", y = "time window", fill = "r") +
+    theme_minimal() +
+    theme(axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          strip.text = element_text(size=28),
+          legend.title = element_text(size=28),
+          legend.text = element_text(size=26))
+```
+
+
+# Manuscript figures
+
+```{r}
+embedding_df <- token_similarity %>%
+  group_by(window1, window2) %>%
+  summarise(cor = mean(cor), .groups = "drop") %>%
+  mutate(diag = window2 - window1) %>%
+  filter(diag > 0) %>%
+  group_by(diag) %>%
+  summarise(m = mean(cor), se = sd(cor)/sqrt(n()), .groups = "drop") %>%
+  mutate(type = "embeddings")
+
+geometry_df <- geometry_similarity %>%
+  group_by(window1, window2) %>%
+  summarise(cor = mean(cor), .groups = "drop") %>%
+  mutate(diag = window2 - window1) %>%
+  filter(diag > 0) %>%
+  group_by(diag) %>%
+  summarise(m = mean(cor), se = sd(cor)/sqrt(n())) %>%
+  mutate(type = "autoRSM")
+
+crossgeometry_df <- crossgeometry_similarity %>%
+  group_by(window1, window2) %>%
+  summarise(cor = mean(cor), .groups = "drop") %>%
+  mutate(diag = window2 - window1) %>%
+  filter(diag > 0) %>%
+  group_by(diag) %>%
+  summarise(m = mean(cor), se = sd(cor)/sqrt(n())) %>%
+  mutate(type = "crossRSM")
+
+combined_df <- bind_rows(list(embedding_df, geometry_df, crossgeometry_df)) %>%
+  mutate(type = factor(type, levels = c("embeddings", "autoRSM", "crossRSM")))
+```
+
+
+## Embedding heatmap
+
+```{r}
+token_similarity %>%
+  group_by(label, window1, window2) %>%
+  summarise(cor = mean(cor), .groups ="drop") %>%
+  group_by(window1, window2) %>%
+  summarise(m = mean(cor), .groups = "drop") %>%
+  ggplot(aes(x=window1, y=window2, fill=m)) +
+    geom_tile() +
+    scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "time window", y = "time window", fill = "Pearson's r") +
+    theme_minimal() +
+    theme(panel.grid = element_blank(),
+          axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          strip.text = element_text(size=28),
+          legend.title = element_text(size=28),
+          legend.text = element_text(size=26),
+          plot.margin = margin(t = 20, r = 20, b = 20, l = 20, unit = "pt"))
+
+# ggsave("figures/manuscript/lang_drift_heatmap.png", bg="white", width=10, height=8)
+```
+
+
+## RSM heatmap
+```{r}
+bind_rows(
+  geometry_over_time %>%
+    group_by(label1, label2, window) %>%
+    summarise(m = mean(cos), .groups = "drop") %>%
+    mutate(cond="autoRSM"),
+  crossgeometry_over_time %>%
+    group_by(label1, label2, window) %>%
+    summarise(m = mean(cos), .groups = "drop") %>%
+    mutate(cond="crossRSM")
+) %>%
+  mutate(cond = factor(cond, levels = c("autoRSM", "crossRSM")),
+         label1 = factor(label1),
+         label2 = factor(label2)) %>%
+  group_by(cond, window) %>%
+  mutate(row = as.numeric(label1), col = as.numeric(label2)) %>%
+  ungroup() %>%
+  filter((cond == "autoRSM" & row < col) | (cond == "crossRSM" & row > col),
+         window %in% c(1,25)) %>%
+  ggplot(aes(x = label1, y = label2, fill = m)) +
+    facet_wrap(~window) +
+    geom_tile() +
+    scale_fill_viridis_c(limits = c(0.5, 0.8), oob = scales::squish,
+                         guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "embedding", y = "embedding", fill = expression(S[cos])) +
+    theme_minimal() +
+    theme(panel.grid = element_blank(),
+          axis.title = element_text(size = 28),
+          axis.text = element_blank(),
+          strip.text = element_text(size = 28),
+          legend.title = element_text(size = 28, margin = margin(b = 15)),
+          legend.text = element_text(size = 26))
+
+# ggsave("figures/manuscript/lang_geometry_heatmap.png", bg="white", width=15, height=8)
+```
+
+
+## Lags
+```{r}
+m_plot <- combined_df %>%
+  filter(diag <= 15) %>%
+  mutate(type = factor(type, levels = c("embeddings", "autoRSM", "crossRSM"))) %>%
+  ggplot(aes(x=diag, y=m, color=type, fill=type)) +
+    geom_line() +
+    geom_ribbon(aes(ymin=m-se, ymax=m+se), alpha=0.2, linetype=0) +
+    scale_color_discrete(palette = "dark2") +
+    scale_fill_discrete(palette = "dark2") +
+    scale_x_continuous(n.breaks=6) +
+    labs(x = "lag", y = "Pearson's r") +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank(),
+          axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          legend.title = element_blank(),
+          legend.text = element_text(size=26),
+          legend.key.spacing.y = unit(1, "cm"),
+          plot.margin = margin(t = 20, r = 20, b = 20, l = 20, unit = "pt"))
+
+se_plot <- combined_df %>%
+  filter(diag <= 15) %>%
+  mutate(type = factor(type, levels = c("embeddings", "autoRSM", "crossRSM"))) %>%
+  ggplot(aes(x=diag, y=se, color=type, fill=type)) +
+    geom_line() +
+    scale_color_discrete(palette = "dark2") +
+    scale_fill_discrete(palette = "dark2") +
+    scale_x_continuous(n.breaks=6) +
+    labs(x = "lag", y = "standard error") +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank(),
+          axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          legend.title = element_blank(),
+          legend.position = "none",
+          plot.margin = margin(t = 20, r = 20, b = 20, l = 20, unit = "pt"))
+
+m_plot + se_plot + plot_layout(guides = "collect")
+
+# ggsave("figures/manuscript/lang_lag.png", bg="white", width=20, height=8)
+```
+
+
+# PCA
+
+```{r}
+pca <- avg_embeddings %>%
+  filter(sim==2) %>%
+  select(!c(n_obs, sim)) %>%
+  pivot_wider(names_from = node, values_from = value) %>%
+  group_by(class) %>%
+  group_modify(~ {
+    metadata <- .x %>%
+      select(window, label)
+
+    features <- .x %>%
+      select(all_of(node_id))
+
+    pca_fit <- prcomp(features, center = T, scale. = T)
+    variance <- 100 * pca_fit$sdev^2 / sum(pca_fit$sdev^2)
+
+    bind_cols(metadata, as.data.frame(pca_fit$x[, 1:3]) %>% set_names(c("PC1", "PC2", "PC3"))) %>%
+      mutate(var_PC1 = variance[1], var_PC2 = variance[2], var_PC3 = variance[3])}) %>%
+  ungroup()
+```
+
+```{r}
+pca %>%
+  arrange(window) %>%
+  ggplot(aes(x=PC1, y=PC2, color=window)) +
+    facet_wrap(~class) +
+    geom_point() +
+    geom_path() +
+    theme_minimal()
+```
+
+
+```{r}
+pcaplot_df <- pca %>%
+  filter(class == "subject", window %in% seq(1, 25, 3)) %>%
+  mutate(window = as.numeric(as.character(window))) %>%
+  arrange(label, window)
+
+last_points <- pcaplot_df %>%
+  group_by(label) %>%
+  filter(window == min(window)) %>%
+  ungroup()
+
+p <- plot_ly(
+  data = pcaplot_df,
+  x = ~PC1,
+  y = ~PC2,
+  z = ~PC3,
+  color = ~window,
+  colors = grDevices::hcl.colors(50, palette = "inferno")[1:45],
+  type = "scatter3d",
+  mode = "markers+lines",
+  split = ~label,
+  showlegend = F,
+  line = list(width = 10),
+  marker = list(size = 10)
+  ) %>%
+  layout(
+  scene = list(
+    aspectmode = "cube",
+    xaxis = list(title = "PC1", titlefont=list(size=50), tick = "", showticklabels = FALSE, gridcolor="black", gridwidth=3),
+    yaxis = list(title = "PC2", titlefont=list(size=50), tick = "", showticklabels = FALSE, gridcolor="black", gridwidth=3),
+    zaxis = list(title = "PC3", titlefont=list(size=50), tick = "", showticklabels = FALSE, gridcolor="black", gridwidth=3)
+  )
+)
+
+p <- plotly_build(p)
+
+for (i in seq_along(p$x$data)) {
+  p$x$data[[i]]$marker$showscale <- FALSE
+}
+
+p <- p %>%
+  add_trace(
+    data = last_points,
+    x = ~PC1,
+    y = ~PC2,
+    z = ~PC3,
+    type = "scatter3d",
+    mode = "text",
+    text = ~label,
+    textposition = "bottom right",
+    textfont = list(
+      size = 50,
+      color = "red"
+    ),
+    showlegend = FALSE,
+    inherit = FALSE
+  )
+
+p
+```
+
+
