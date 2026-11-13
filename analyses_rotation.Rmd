@@ -1,0 +1,316 @@
+---
+title: "Drift and similarity (rotation)"
+output: ''
+date: "2026-11-13"
+---
+
+```{r, warning=FALSE}
+library(tidyverse)
+```
+
+
+# Process data
+
+```{r}
+data_full <- read.csv("data/rotation.csv")
+```
+
+```{r}
+data_filtered <- data_full %>%
+  filter(run <= 10, iteration > 3000,
+         orientation_degrees %in% c(0, 45, 90, 135, 180, 225, 270, 315))
+
+orientation_list <- unique(data_filtered$orientation_degrees)
+node_id <- colnames(data_filtered[,1:250])
+sim_id <- c(1:10)
+```
+
+```{r}
+n_windows=25
+
+avg_embeddings <- data_filtered %>%
+  mutate(window = cut(iteration, breaks = seq(min(iteration, na.rm = TRUE), max(iteration, na.rm = TRUE),
+                                         length.out = n_windows + 1), include.lowest = TRUE, labels = FALSE)) %>%
+  group_by(window, orientation_degrees, run) %>%
+  summarise(n_obs = n(), across(all_of(node_id), ~ mean(.x)), .groups = "drop") %>%
+  pivot_longer(cols = all_of(node_id), names_to = "node", values_to = "value") %>%
+  mutate(orientation_degrees = factor(orientation_degrees))
+```
+
+
+# Drift
+
+```{r}
+orientation_combs <- expand.grid(f1=orientation_list, f2=sim_id)
+
+degree_similarity <- do.call(rbind, lapply(seq_len(nrow(orientation_combs)), function(row){
+  subset <- avg_embeddings %>%
+    filter(orientation_degrees==orientation_combs[row,1],
+           run==orientation_combs[row,2]) %>%
+    pivot_wider(names_from = node, values_from = value)
+  
+  windows <- subset$window
+  x <- as.matrix(subset %>% ungroup() %>% select(!c(window,orientation_degrees,run,n_obs)))
+  n <- nrow(x)
+ 
+  pairs <- combn(n,2)
+  r <- apply(pairs, 2, function(p) {cor(x[p[1], ], x[p[2], ], method = "pearson")})
+
+  data.frame(label=orientation_combs[row,1],
+             sim=orientation_combs[row,2],
+             window1=pairs[1,],
+             window2=pairs[2,],
+             cor=r)
+}))
+```
+
+```{r}
+degree_similarity %>%
+  group_by(label, window1, window2) %>%
+  summarise(cor = mean(cor), .groups ="drop") %>%
+  group_by(window1, window2) %>%
+  summarise(m = mean(cor), .groups = "drop") %>%
+  ggplot(aes(x=window1, y=window2, fill=m)) +
+    geom_tile() +
+    scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "time window", y = "time window", fill = "Pearson's r") +
+    theme_minimal() +
+    theme(panel.grid = element_blank(),
+          axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          strip.text = element_text(size=28),
+          legend.title = element_text(size=28),
+          legend.text = element_text(size=26),
+          plot.margin = margin(t = 20, r = 20, b = 20, l = 20, unit = "pt"))
+```
+
+
+## Cross-embedding corr
+```{r}
+cross_combs <- combn(orientation_list, 2, simplify = FALSE)
+
+cross_similarity <- do.call(rbind, lapply(cross_combs, function(pair) {
+
+  do.call(rbind, lapply(sim_id, function(s) {
+
+    token1 <- avg_embeddings %>%
+      filter(orientation_degrees == pair[1], run == s) %>%
+      pivot_wider(names_from = node, values_from = value) %>%
+      arrange(window)
+
+    token2 <- avg_embeddings %>%
+      filter(orientation_degrees == pair[2], run == s) %>%
+      pivot_wider(names_from = node, values_from = value) %>%
+      arrange(window)
+
+    x <- as.matrix(token1 %>% ungroup %>% select(!c(window, orientation_degrees, run, n_obs)))
+
+    y <- as.matrix(token2 %>% ungroup %>% select(!c(window, orientation_degrees, run, n_obs)))
+
+    # vectorized correlation
+    x_centered <- x - rowMeans(x)
+    y_centered <- y - rowMeans(y)
+    
+    x_norm <- x_centered / sqrt(rowSums(x_centered^2))
+    y_norm <- y_centered / sqrt(rowSums(y_centered^2))
+    
+    pearson <- x_norm %*% t(y_norm)
+
+    # store
+    expand.grid(window1 = token1$window, window2 = token2$window) %>%
+      mutate(label1 = pair[1], label2 = pair[2], sim = s, cor = as.vector(pearson), pair = paste(pair, collapse = "x"))
+ }))
+}))
+```
+
+```{r}
+cross_similarity %>%
+  group_by(pair, window1, window2) %>%
+  summarise(cor = mean(cor), .groups ="drop") %>%
+  group_by(window1, window2) %>%
+  summarise(m = mean(cor), .groups = "drop") %>%
+  filter(window2 >= window1) %>%
+  ggplot(aes(x=window1, y=window2, fill=m)) +
+    geom_tile() +
+    scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "time window", y = "time window", fill = "Pearson's r") +
+    theme_minimal() +
+    theme(panel.grid = element_blank(),
+          axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          strip.text = element_text(size=28),
+          legend.title = element_text(size=28),
+          legend.text = element_text(size=26),
+          plot.margin = margin(t = 20, r = 20, b = 20, l = 20, unit = "pt"))
+```
+
+
+## Cross-run autocorr
+
+```{r}
+run_pairs <- data.frame(
+  run1 = sim_id,
+  run2 = c(sim_id[-1], sim_id[1])
+)
+
+orientation_combs <- expand.grid(
+  orientation = orientation_list,
+  pair_id = seq_len(nrow(run_pairs))
+)
+
+crossrun_degree_similarity <- do.call(rbind, lapply(seq_len(nrow(orientation_combs)), function(row) {
+
+  orientation <- orientation_combs$orientation[row]
+  pair_id <- orientation_combs$pair_id[row]
+
+  r1 <- run_pairs$run1[pair_id]
+  r2 <- run_pairs$run2[pair_id]
+
+  token1 <- avg_embeddings %>%
+    filter(orientation_degrees == orientation, run == r1) %>%
+    pivot_wider(names_from = node, values_from = value) %>%
+    arrange(window) %>%
+    arrange(window)
+
+  token2 <- avg_embeddings %>%
+    filter(orientation_degrees == orientation, run == r2) %>%
+    pivot_wider(names_from = node, values_from = value) %>%
+    arrange(window) %>%
+    arrange(window)
+
+  x <- as.matrix(token1 %>% select(all_of(node_id)))
+  y <- as.matrix(token2 %>% select(all_of(node_id)))
+
+  # Pearson correlation within each corresponding window
+  cors <- sapply(seq_len(nrow(x)), function(i) {
+    cor(x[i, ], y[i, ], method = "pearson")
+  })
+
+  # Store results
+  data.frame(
+    label = orientation,
+    sim1 = r1,
+    sim2 = r2,
+    window = token1$window,
+    cor = cors
+  )
+
+}))
+```
+
+
+# Lag
+
+```{r}
+autolag <- degree_similarity %>%
+  group_by(label, window1, window2) %>%
+  summarise(cor = mean(cor), .groups = "drop") %>%
+  group_by(window1, window2) %>%
+  summarise(cor = mean(cor), .groups = "drop") %>%
+  mutate(diag = window2 - window1) %>%
+  filter(diag > 0) %>%
+  group_by(diag) %>%
+  summarise(m = mean(cor), se = sd(cor)/sqrt(n()), .groups = "drop") %>%
+  mutate(type = "autolag")
+
+crosslag <- cross_similarity %>%
+  group_by(pair, window1, window2) %>%
+  summarise(cor = mean(cor), .groups = "drop") %>%
+  group_by(window1, window2) %>%
+  summarise(cor = mean(cor), .groups = "drop") %>%
+  mutate(diag = window2 - window1) %>%
+  filter(diag > 0) %>%
+  group_by(diag) %>%
+  summarise(m = mean(cor), se = sd(cor)/sqrt(n()), .groups = "drop") %>%
+  mutate(type = "crosslag")
+
+crossemb <- cross_similarity %>%
+  filter(window1==window2) %>%
+  select(!window2) %>%
+  group_by(pair, window1) %>%
+  summarise(cor = mean(cor), .groups = "drop") %>%
+  group_by(window1) %>%
+  summarise(m = mean(cor), se = sd(cor)/sqrt(n()), .groups = "drop") %>%
+  filter(window1>5, window1<=20) %>%
+  mutate(diag = row_number()) %>%
+  # rename("diag" = "window1") %>%
+  mutate(type = "crossemb")
+
+crossrun <- crossrun_degree_similarity %>%
+  select(!sim2) %>%
+  group_by(window, label) %>%
+  summarise(cor = mean(cor), .groups = "drop") %>%
+  group_by(window) %>%
+  summarise(m = mean(cor), se = sd(cor)/sqrt(n()), .groups = "drop") %>%
+  rename("diag" = window) %>%
+  mutate(type = "crossrun")
+
+combined_df <- bind_rows(list(autolag, crosslag, crossemb)) %>%
+  mutate(type = factor(type,
+                       levels = c("autolag", "crossemb", "crosslag"),
+                       labels = c("autocorrelation",
+                                  "cross-correlation\n(within-window)",
+                                  "cross-correlation\n(between-window)")))
+```
+
+```{r}
+combined_df %>%
+  filter(diag <= 15) %>%
+  ggplot(aes(x=diag, y=m, color=type, fill=type)) +
+    geom_line() +
+    geom_ribbon(aes(ymin=m-se, ymax=m+se), alpha=0.2, linetype=0) +
+    scale_color_discrete(palette = "dark2") +
+    scale_fill_discrete(palette = "dark2") +
+    scale_x_continuous(n.breaks=6) +
+    labs(x = "lag / window", y = "Pearson's r") +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank(),
+          axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          legend.position = "top",
+          legend.title = element_blank(),
+          legend.text = element_text(size=26),
+          legend.key.spacing.x = unit(1, "cm"),
+          plot.margin = margin(t = 20, r = 20, b = 20, l = 20, unit = "pt"))
+
+# ggsave("figures/manuscript/rot_lag.png", bg="white", width=12, height=8)
+```
+
+
+# Heatmaps
+
+```{r}
+autohm_df <- token_similarity %>%
+  group_by(label, window1, window2) %>%
+  summarise(cor = mean(cor), .groups ="drop") %>%
+  group_by(window1, window2) %>%
+  summarise(m = mean(cor), .groups = "drop") %>%
+  rbind(data.frame(window1=c(1:25), window2=c(1:25), m=1)) %>%
+  mutate(type = "autocorrelation")
+
+crosshm_df <- cross_similarity %>%
+  group_by(pair, window1, window2) %>%
+  summarise(cor = mean(cor), .groups ="drop") %>%
+  group_by(window1, window2) %>%
+  summarise(m = mean(cor), .groups = "drop") %>%
+  filter(window2 >= window1)%>%
+  mutate(type = "crosscorrelation")
+  
+rbind(autohm_df, crosshm_df) %>%
+  ggplot(aes(x=window1, y=window2, fill=m)) +
+    facet_wrap(~type) +
+    geom_tile() +
+    scale_fill_viridis_c(guide = guide_colorbar(barheight = unit(10, "cm"), barwidth = unit(1, "cm"))) +
+    labs(x = "time window", y = "time window", fill = "Pearson's r") +
+    theme_minimal() +
+    theme(panel.grid = element_blank(),
+          axis.title = element_text(size=28),
+          axis.text = element_text(size=26),
+          strip.text = element_text(size=28),
+          legend.title = element_text(size=28, margin = margin(b = 15)),
+          legend.text = element_text(size=26),
+          plot.margin = margin(t = 20, r = 20, b = 20, l = 20, unit = "pt"))
+
+# ggsave("figures/manuscript/rot_heatmaps.png", bg="white", width=20, height=10)
+```
+

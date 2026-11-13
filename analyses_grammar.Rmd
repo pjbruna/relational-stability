@@ -1,5 +1,5 @@
 ---
-title: "Drift and stability"
+title: "Drift and stability (grammar)"
 output: html_document
 date: "2026-11-08"
 ---
